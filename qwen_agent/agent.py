@@ -1,11 +1,8 @@
 # Copyright 2023 The Qwen team, Alibaba Group. All rights reserved.
-# 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
 #    http://www.apache.org/licenses/LICENSE-2.0
-# 
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,7 +15,6 @@ import traceback
 from abc import ABC, abstractmethod
 from typing import Dict, Iterator, List, Optional, Tuple, Union
 
-from qwen_agent.llm import get_chat_model
 from qwen_agent.llm.base import BaseChatModel
 from qwen_agent.llm.schema import CONTENT, DEFAULT_SYSTEM_MESSAGE, ROLE, SYSTEM, ContentItem, Message
 from qwen_agent.log import logger
@@ -26,6 +22,9 @@ from qwen_agent.tools import TOOL_REGISTRY, BaseTool, MCPManager
 from qwen_agent.tools.base import ToolServiceError
 from qwen_agent.tools.simple_doc_parser import DocParserError
 from qwen_agent.utils.utils import has_chinese_messages, merge_generate_cfgs
+
+from qwen_agent.llm.manager import LLMManager
+from qwen_agent.tools.manager import ToolManager
 
 
 class Agent(ABC):
@@ -53,20 +52,21 @@ class Agent(ABC):
             name: The name of this agent.
             description: The description of this agent, which will be used for multi_agent.
         """
-        if isinstance(llm, dict):
-            self.llm = get_chat_model(llm)
-        else:
-            self.llm = llm
+        self._llm_manager = LLMManager(llm)
+        self._tool_manager = ToolManager(function_list)
+        
         self.extra_generate_cfg: dict = {}
-
-        self.function_map = {}
-        if function_list:
-            for tool in function_list:
-                self._init_tool(tool)
-
         self.system_message = system_message
         self.name = name
         self.description = description
+
+    @property
+    def llm(self) -> Optional[BaseChatModel]:
+        return self._llm_manager.get_llm()
+    
+    @property
+    def function_map(self) -> Dict[str, BaseTool]:
+        return {name: self._tool_manager.get_tool(name) for name in self._tool_manager.list_tools()}
 
     def run_nonstream(self, messages: List[Union[Dict, Message]], **kwargs) -> Union[List[Message], List[Dict]]:
         """Same as self.run, but with stream=False,
@@ -167,13 +167,15 @@ class Agent(ABC):
         Yields:
             The response generator of LLM.
         """
-        return self.llm.chat(messages=messages,
-                             functions=functions,
-                             stream=stream,
-                             extra_generate_cfg=merge_generate_cfgs(
-                                 base_generate_cfg=self.extra_generate_cfg,
-                                 new_generate_cfg=extra_generate_cfg,
-                             ))
+        return self._llm_manager.call(
+            messages=messages,
+            functions=functions,
+            stream=stream,
+            extra_generate_cfg=merge_generate_cfgs(
+                base_generate_cfg=self.extra_generate_cfg,
+                new_generate_cfg=extra_generate_cfg,
+            )
+        )
 
     def _call_tool(self, tool_name: str, tool_args: Union[str, dict] = '{}', **kwargs) -> Union[str, List[ContentItem]]:
         """The interface of calling tools for the agent.
@@ -185,11 +187,8 @@ class Agent(ABC):
         Returns:
             The output of tools.
         """
-        if tool_name not in self.function_map:
-            return f'Tool {tool_name} does not exists.'
-        tool = self.function_map[tool_name]
         try:
-            tool_result = tool.call(tool_args, **kwargs)
+            return self._tool_manager.call(tool_name, tool_args, **kwargs)
         except (ToolServiceError, DocParserError) as ex:
             raise ex
         except Exception as ex:
@@ -202,39 +201,8 @@ class Agent(ABC):
             logger.warning(error_message)
             return error_message
 
-        if isinstance(tool_result, str):
-            return tool_result
-        elif isinstance(tool_result, list) and all(isinstance(item, ContentItem) for item in tool_result):
-            return tool_result  # multimodal tool results
-        else:
-            return json.dumps(tool_result, ensure_ascii=False, indent=4)
-
     def _init_tool(self, tool: Union[str, Dict, BaseTool]):
-        if isinstance(tool, BaseTool):
-            tool_name = tool.name
-            if tool_name in self.function_map:
-                logger.warning(f'Repeatedly adding tool {tool_name}, will use the newest tool in function list')
-            self.function_map[tool_name] = tool
-        elif isinstance(tool, dict) and 'mcpServers' in tool:
-            tools = MCPManager().initConfig(tool)
-            for tool in tools:
-                tool_name = tool.name
-                if tool_name in self.function_map:
-                    logger.warning(f'Repeatedly adding tool {tool_name}, will use the newest tool in function list')
-                self.function_map[tool_name] = tool
-        else:
-            if isinstance(tool, dict):
-                tool_name = tool['name']
-                tool_cfg = tool
-            else:
-                tool_name = tool
-                tool_cfg = None
-            if tool_name not in TOOL_REGISTRY:
-                raise ValueError(f'Tool {tool_name} is not registered.')
-
-            if tool_name in self.function_map:
-                logger.warning(f'Repeatedly adding tool {tool_name}, will use the newest tool in function list')
-            self.function_map[tool_name] = TOOL_REGISTRY[tool_name](tool_cfg)
+        self._tool_manager.add_tool(tool)
 
     def _detect_tool(self, message: Message) -> Tuple[bool, str, str, str]:
         """A built-in tool call detection for func_call format message.
@@ -257,6 +225,92 @@ class Agent(ABC):
             text = ''
 
         return (func_name is not None), func_name, func_args, text
+
+    def set_llm(self, llm: Union[dict, BaseChatModel]) -> None:
+        """
+        动态设置LLM实例
+        
+        Args:
+            llm: LLM配置字典或LLM实例
+        """
+        self._llm_manager.set_llm(llm)
+    
+    def get_llm(self) -> Optional[BaseChatModel]:
+        """获取当前LLM实例
+        
+        Returns:
+            当前的LLM实例，如果未设置则返回None
+        """
+        return self._llm_manager.get_llm()
+    
+    def switch_llm(self, llm_config: Dict) -> BaseChatModel:
+        """切换到新的LLM实例
+        
+        Args:
+            llm_config: 新的LLM配置
+            
+        Returns:
+            新的LLM实例
+        """
+        return self._llm_manager.switch_llm(llm_config)
+    
+    def add_tool(self, tool: Union[str, Dict, BaseTool]) -> None:
+        """添加工具到Agent
+        
+        Args:
+            tool: 工具名称、配置字典或工具实例
+        """
+        self._tool_manager.add_tool(tool)
+    
+    def remove_tool(self, tool_name: str) -> bool:
+        """从Agent中移除工具
+        
+        Args:
+            tool_name: 要移除的工具名称
+            
+        Returns:
+            如果成功移除返回True，如果工具不存在返回False
+        """
+        return self._tool_manager.remove_tool(tool_name)
+    
+    def get_tool(self, tool_name: str) -> Optional[BaseTool]:
+        """获取指定名称的工具实例
+        
+        Args:
+            tool_name: 工具名称
+            
+        Returns:
+            工具实例，如果不存在返回None
+        """
+        return self._tool_manager.get_tool(tool_name)
+    
+    def list_tools(self) -> List[str]:
+        """列出所有已加载的工具名称
+        
+        Returns:
+            工具名称列表
+        """
+        return self._tool_manager.list_tools()
+    
+    def get_tool_functions(self) -> List[Dict]:
+        """获取所有工具的函数描述信息
+        
+        Returns:
+            工具函数描述信息列表
+        """
+        return self._tool_manager.get_tool_functions()
+    
+    def replace_tool(self, tool_name: str, new_tool: Union[str, Dict, BaseTool]) -> bool:
+        """替换指定名称的工具
+        
+        Args:
+            tool_name: 要替换的工具名称
+            new_tool: 新的工具（名称、配置或实例）
+            
+        Returns:
+            如果成功替换返回True，如果原工具不存在返回False
+        """
+        return self._tool_manager.replace_tool(tool_name, new_tool)
 
 
 # The most basic form of an agent is just a LLM, not augmented with any tool or workflow.
