@@ -14,7 +14,7 @@
 
 import copy
 from abc import ABC
-from typing import Dict, Iterator, List, Literal, Optional, Union
+from typing import Dict, Iterator, List, Literal, Optional, Union, AsyncIterator
 
 from qwen_agent.llm.base import BaseChatModel
 from qwen_agent.llm.schema import ASSISTANT, FUNCTION, USER, ContentItem, Message
@@ -132,6 +132,26 @@ class BaseFnCallModel(BaseChatModel, ABC):
                 del generate_cfg[k]
         return self._continue_assistant_response(messages, generate_cfg=generate_cfg, stream=stream)
 
+    async def _async_chat_with_functions(
+        self,
+        messages: List[Message],
+        functions: List[Dict],
+        stream: bool,
+        delta_stream: bool,
+        generate_cfg: dict,
+        lang: Literal['en', 'zh'],
+    ) -> Union[List[Message], AsyncIterator[List[Message]]]:
+        """异步版本的_chat_with_functions"""
+        if delta_stream:
+            raise NotImplementedError('Please use stream=True with delta_stream=False, because delta_stream=True'
+                                      ' is not implemented for function calling due to some technical reasons.')
+        generate_cfg = copy.deepcopy(generate_cfg)
+        for k in ['parallel_function_calls', 'function_choice', 'thought_in_content']:
+            if k in generate_cfg:
+                del generate_cfg[k]
+        async for response in self._async_continue_assistant_response(messages, generate_cfg=generate_cfg, stream=stream):
+            yield response
+
     def _continue_assistant_response(
         self,
         messages: List[Message],
@@ -140,6 +160,16 @@ class BaseFnCallModel(BaseChatModel, ABC):
     ) -> Iterator[List[Message]]:
         messages = simulate_response_completion_with_chat(messages)
         return self._chat(messages, stream=stream, delta_stream=False, generate_cfg=generate_cfg)
+    
+    async def _async_continue_assistant_response(
+        self,
+        messages: List[Message],
+        generate_cfg: dict,
+        stream: bool,
+    ) -> AsyncIterator[List[Message]]:
+        messages = simulate_response_completion_with_chat(messages)
+        async for response in self._async_chat(messages, stream=stream, delta_stream=False, generate_cfg=generate_cfg):
+            yield response
 
 
 def simulate_response_completion_with_chat(messages: List[Message]) -> List[Message]:

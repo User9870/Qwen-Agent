@@ -16,7 +16,7 @@ import copy
 import logging
 import os
 from pprint import pformat
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, AsyncIterator
 
 import openai
 
@@ -63,37 +63,41 @@ class TextChatAtOAI(BaseFnCallModel):
                 api_kwargs['base_url'] = api_base
             if api_key:
                 api_kwargs['api_key'] = api_key
+            
+            self._client = openai.OpenAI(**api_kwargs)
+            self._async_client = openai.AsyncOpenAI(**api_kwargs)
 
             def _chat_complete_create(*args, **kwargs):
                 # OpenAI API v1 does not allow the following args, must pass by extra_body
-                extra_params = ['top_k', 'repetition_penalty']
-                if any((k in kwargs) for k in extra_params):
-                    kwargs['extra_body'] = copy.deepcopy(kwargs.get('extra_body', {}))
-                    for k in extra_params:
-                        if k in kwargs:
-                            kwargs['extra_body'][k] = kwargs.pop(k)
-                if 'request_timeout' in kwargs:
-                    kwargs['timeout'] = kwargs.pop('request_timeout')
-
-                client = openai.OpenAI(**api_kwargs)
-                return client.chat.completions.create(*args, **kwargs)
+                kwargs = self._adapt_generate_cfg_for_openai_v1(kwargs)
+                return self._client.chat.completions.create(*args, **kwargs)
 
             def _complete_create(*args, **kwargs):
                 # OpenAI API v1 does not allow the following args, must pass by extra_body
+                kwargs = self._adapt_generate_cfg_for_openai_v1(kwargs)
+                return self._client.completions.create(*args, **kwargs)
+
+            self._complete_create = _complete_create
+            self._chat_complete_create = _chat_complete_create
+            
+            # For async support in v1.x
+            async def _async_chat_complete_create(*args, **kwargs):
+                # OpenAI API v1 does not allow the following args, must pass by extra_body
+                kwargs = self._adapt_generate_cfg_for_openai_v1(kwargs)
+                return await self._async_client.chat.completions.create(*args, **kwargs)
+
+            self._async_chat_complete_create = _async_chat_complete_create
+    def _adapt_generate_cfg_for_openai_v1(self, kwargs: dict) -> dict:
+                kwargs = copy.deepcopy(kwargs)
                 extra_params = ['top_k', 'repetition_penalty']
-                if any((k in kwargs) for k in extra_params):
-                    kwargs['extra_body'] = copy.deepcopy(kwargs.get('extra_body', {}))
+                if any(k in kwargs for k in extra_params):
+                    kwargs.setdefault('extra_body', {})
                     for k in extra_params:
                         if k in kwargs:
                             kwargs['extra_body'][k] = kwargs.pop(k)
                 if 'request_timeout' in kwargs:
                     kwargs['timeout'] = kwargs.pop('request_timeout')
-
-                client = openai.OpenAI(**api_kwargs)
-                return client.completions.create(*args, **kwargs)
-
-            self._complete_create = _complete_create
-            self._chat_complete_create = _chat_complete_create
+                return kwargs
 
     def _chat_stream(
         self,
@@ -158,6 +162,70 @@ class TextChatAtOAI(BaseFnCallModel):
         except OpenAIError as ex:
             raise ModelServiceError(exception=ex)
 
+    async def _async_chat_stream(
+        self,
+        messages: List[Message],
+        delta_stream: bool,
+        generate_cfg: dict,
+    ) -> AsyncIterator[List[Message]]:
+        """异步版本的_chat_stream方法"""
+        messages = self.convert_messages_to_dicts(messages)
+        logger.debug(f'LLM Input generate_cfg: \n{generate_cfg}')
+        try:
+            response = await self._async_chat_complete_create(model=self.model, messages=messages, stream=True, **generate_cfg)
+            if delta_stream:
+                async for chunk in response:
+                    if chunk.choices:
+                        if hasattr(chunk.choices[0].delta,
+                                   'reasoning_content') and chunk.choices[0].delta.reasoning_content:
+                            yield [
+                                Message(role=ASSISTANT,
+                                        content='',
+                                        reasoning_content=chunk.choices[0].delta.reasoning_content)
+                            ]
+                        if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
+                            yield [Message(role=ASSISTANT, content=chunk.choices[0].delta.content)]
+            else:
+                full_response = ''
+                full_reasoning_content = ''
+                full_tool_calls = []
+                async for chunk in response:
+                    if chunk.choices:
+                        if hasattr(chunk.choices[0].delta,
+                                   'reasoning_content') and chunk.choices[0].delta.reasoning_content:
+                            full_reasoning_content += chunk.choices[0].delta.reasoning_content
+                        if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
+                            full_response += chunk.choices[0].delta.content
+                        if hasattr(chunk.choices[0].delta, 'tool_calls') and chunk.choices[0].delta.tool_calls:
+                            for tc in chunk.choices[0].delta.tool_calls:
+                                if full_tool_calls and (not tc.id or
+                                                        tc.id == full_tool_calls[-1]['extra']['function_id']):
+                                    if tc.function.name:
+                                        full_tool_calls[-1].function_call['name'] += tc.function.name
+                                    if tc.function.arguments:
+                                        full_tool_calls[-1].function_call['arguments'] += tc.function.arguments
+                                else:
+                                    full_tool_calls.append(
+                                        Message(role=ASSISTANT,
+                                                content='',
+                                                function_call=FunctionCall(name=tc.function.name,
+                                                                           arguments=tc.function.arguments),
+                                                extra={'function_id': tc.id}))
+
+                        res = []
+                        if full_reasoning_content:
+                            res.append(Message(role=ASSISTANT, content='', reasoning_content=full_reasoning_content))
+                        if full_response:
+                            res.append(Message(
+                                role=ASSISTANT,
+                                content=full_response,
+                            ))
+                        if full_tool_calls:
+                            res += full_tool_calls
+                        yield res
+        except OpenAIError as ex:
+            raise ModelServiceError(exception=ex)
+
     def _chat_no_stream(
         self,
         messages: List[Message],
@@ -166,6 +234,26 @@ class TextChatAtOAI(BaseFnCallModel):
         messages = self.convert_messages_to_dicts(messages)
         try:
             response = self._chat_complete_create(model=self.model, messages=messages, stream=False, **generate_cfg)
+            if hasattr(response.choices[0].message, 'reasoning_content'):
+                return [
+                    Message(role=ASSISTANT,
+                            content=response.choices[0].message.content,
+                            reasoning_content=response.choices[0].message.reasoning_content)
+                ]
+            else:
+                return [Message(role=ASSISTANT, content=response.choices[0].message.content)]
+        except OpenAIError as ex:
+            raise ModelServiceError(exception=ex)
+
+    async def _async_chat_no_stream(
+        self,
+        messages: List[Message],
+        generate_cfg: dict,
+    ) -> List[Message]:
+        """异步版本的_chat_no_stream方法"""
+        messages = self.convert_messages_to_dicts(messages)
+        try:
+            response = await self._async_chat_complete_create(model=self.model, messages=messages, stream=False, **generate_cfg)
             if hasattr(response.choices[0].message, 'reasoning_content'):
                 return [
                     Message(role=ASSISTANT,

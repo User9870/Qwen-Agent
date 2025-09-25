@@ -160,3 +160,26 @@ class LLMManager:
             raise ValueError("No LLM instance is set. Please set an LLM before calling it.")
         
         return self._current_llm.chat(*args, **kwargs)
+    
+    async def async_call(self, *args, **kwargs) -> Any:
+        """异步调用当前LLM的chat方法
+        
+        Args:
+            *args: 传递给chat方法的位置参数
+            **kwargs: 传递给chat方法的关键字参数
+            
+        Returns:
+            LLM的响应结果
+            
+        Raises:
+            ValueError: 如果未设置LLM实例
+        """
+        if not self.has_llm():
+            raise ValueError("No LLM instance is set. Please set an LLM before calling it.")
+        
+        # Check if LLM has async_chat method
+        if hasattr(self._current_llm, 'async_chat'):
+            return await self._current_llm.async_chat(*args, **kwargs)
+        else:
+            # Fallback to synchronous method
+            return self._current_llm.chat(*args, **kwargs)

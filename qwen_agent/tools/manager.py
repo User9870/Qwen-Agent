@@ -126,6 +126,32 @@ class ToolManager:
         tool = self._tools[tool_name]
         return tool.call(tool_args, **kwargs)
     
+    async def async_call(self, tool_name: str, tool_args: Union[str, dict] = '{}', **kwargs) -> Any:
+        """
+        异步调用指定工具
+        
+        Args:
+            tool_name: 工具名称
+            tool_args: 工具参数
+            **kwargs: 其他参数
+            
+        Returns:
+            工具调用结果
+            
+        Raises:
+            ValueError: 如果工具不存在
+        """
+        if tool_name not in self._tools:
+            raise ValueError(f'Tool {tool_name} does not exist.')
+        
+        tool = self._tools[tool_name]
+        # Check if tool has async_call method
+        if hasattr(tool, 'async_call'):
+            return await tool.async_call(tool_args, **kwargs)
+        else:
+            # Fallback to synchronous method
+            return tool.call(tool_args, **kwargs)
+    
     def replace_tool(self, tool_name: str, new_tool: Union[str, Dict, BaseTool]) -> bool:
         """替换指定名称的工具
         

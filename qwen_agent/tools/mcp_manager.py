@@ -30,13 +30,19 @@ from qwen_agent.tools.base import BaseTool
 
 class MCPManager:
     _instance = None  # Private class variable to store the unique instance
+    _lock = threading.Lock()
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
-            cls._instance = super(MCPManager, cls).__new__(cls, *args, **kwargs)
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(MCPManager, cls).__new__(cls, *args, **kwargs)
         return cls._instance
 
     def __init__(self):
+        if hasattr(self, '_initialized'):
+            return 
+        self._initialized = True
         if not hasattr(self, 'clients'):  # The singleton should only be inited once
             """Set a new event loop in a separate thread"""
             try:
@@ -262,7 +268,7 @@ class MCPManager:
         return tools
 
     def create_tool_class(self, register_name, register_client_id, tool_name, tool_desc, tool_parameters):
-
+        manager = MCPManager()
         class ToolClass(BaseTool):
             name = register_name
             description = tool_desc
@@ -272,12 +278,26 @@ class MCPManager:
             def call(self, params: Union[str, dict], **kwargs) -> str:
                 tool_args = json.loads(params)
                 # Submit coroutine to the event loop and wait for the result
-                manager = MCPManager()
                 client = manager.clients[self.client_id]
                 future = asyncio.run_coroutine_threadsafe(client.execute_function(tool_name, tool_args), manager.loop)
                 try:
                     result = future.result()
                     return result
+                except Exception as e:
+                    logger.info(f'Failed in executing MCP tool: {e}')
+                    raise e
+            
+            async def async_call(self, params: Union[str, dict], **kwargs) -> str:
+                tool_args = json.loads(params)
+                client = manager.clients[self.client_id]
+
+                future = asyncio.run_coroutine_threadsafe(
+                    client.execute_function(tool_name, tool_args),
+                    manager.loop
+                )
+
+                try:
+                    return await asyncio.wrap_future(future)
                 except Exception as e:
                     logger.info(f'Failed in executing MCP tool: {e}')
                     raise e

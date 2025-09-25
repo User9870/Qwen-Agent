@@ -137,6 +137,21 @@ class BaseTool(ABC):
         """
         raise NotImplementedError
 
+    async def async_call(self, params: Union[str, dict], **kwargs) -> Union[str, list, dict, List[ContentItem]]:
+        """
+        The interface for calling tools asynchronously.
+
+        Each tool needs to implement this function, which is the workflow of the tool.
+
+        Args:
+            params: The parameters of func_call.
+            kwargs: Additional parameters for calling tools.
+
+        Returns:
+            The result returned by the tool, implemented in the subclass.
+        """
+    raise NotImplementedError
+
     def _verify_json_format_args(self, params: Union[str, dict], strict_json: bool = False) -> dict:
         """Verify the parameters of the function call"""
         if isinstance(params, str):

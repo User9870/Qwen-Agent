@@ -13,7 +13,7 @@ import copy
 import json
 import traceback
 from abc import ABC, abstractmethod
-from typing import Dict, Iterator, List, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Tuple, Union, AsyncIterator
 
 from qwen_agent.llm.base import BaseChatModel
 from qwen_agent.llm.schema import CONTENT, DEFAULT_SYSTEM_MESSAGE, ROLE, SYSTEM, ContentItem, Message
@@ -201,6 +201,156 @@ class Agent(ABC):
             logger.warning(error_message)
             return error_message
 
+    # 异步方法
+    async def async_run(self, messages: List[Union[Dict, Message]], **kwargs) -> Union[AsyncIterator[List[Message]], AsyncIterator[List[Dict]]]:
+        """异步版本的run方法
+        
+        Return one response generator based on the received messages.
+
+        This method performs a uniform type conversion for the inputted messages,
+        and calls the _async_run method to generate a reply.
+
+        Args:
+            messages: A list of messages.
+        Yields:
+            The response generator.
+        """
+        messages = copy.deepcopy(messages)
+        _return_message_type = 'dict'
+        new_messages = []
+        # Only return dict when all input messages are dict
+        if not messages:
+            _return_message_type = 'message'
+        for msg in messages:
+            if isinstance(msg, dict):
+                new_messages.append(Message(**msg))
+            else:
+                new_messages.append(msg)
+                _return_message_type = 'message'
+
+        if 'lang' not in kwargs:
+            if has_chinese_messages(new_messages):
+                kwargs['lang'] = 'zh'
+            else:
+                kwargs['lang'] = 'en'
+
+        if self.system_message:
+            if not new_messages or new_messages[0][ROLE] != SYSTEM:
+                # Add the system instruction to the agent
+                new_messages.insert(0, Message(role=SYSTEM, content=self.system_message))
+            else:
+                # Already got system message in new_messages
+                if isinstance(new_messages[0][CONTENT], str):
+                    new_messages[0][CONTENT] = self.system_message + '\n\n' + new_messages[0][CONTENT]
+                else:
+                    assert isinstance(new_messages[0][CONTENT], list)
+                    assert new_messages[0][CONTENT][0].text
+                    new_messages[0][CONTENT] = [ContentItem(text=self.system_message + '\n\n')
+                                               ] + new_messages[0][CONTENT]  # noqa
+
+        async for rsp in self._async_run(messages=new_messages, **kwargs):
+            for i in range(len(rsp)):
+                if not rsp[i].name and self.name:
+                    rsp[i].name = self.name
+            if _return_message_type == 'message':
+                yield [Message(**x) if isinstance(x, dict) else x for x in rsp]
+            else:
+                yield [x.model_dump() if not isinstance(x, dict) else x for x in rsp]
+
+    async def async_run_nonstream(self, messages: List[Union[Dict, Message]], **kwargs) -> Union[List[Message], List[Dict]]:
+        """异步版本的run_nonstream方法
+        
+        Same as self.async_run, but with stream=False,
+        meaning it returns the complete response directly
+        instead of streaming the response incrementally.
+        """
+        async for last_responses in self.async_run(messages, **kwargs):
+            pass
+        # Return the last response
+        return last_responses
+
+    async def _async_run(self, messages: List[Message], lang: str = 'en', **kwargs) -> AsyncIterator[List[Message]]:
+        """异步版本的_run方法
+        
+        Return one response generator based on the received messages.
+
+        The workflow for an agent to generate a reply.
+        Each agent subclass needs to implement this method.
+
+        Args:
+            messages: A list of messages.
+            lang: Language, which will be used to select the language of the prompt
+              during the agent's execution process.
+
+        Yields:
+            The response generator.
+        """
+        raise NotImplementedError
+
+    async def _async_call_llm(
+        self,
+        messages: List[Message],
+        functions: Optional[List[Dict]] = None,
+        stream: bool = True,
+        extra_generate_cfg: Optional[dict] = None,
+    ) -> Union[AsyncIterator[List[Message]], List[Message]]:
+        """异步版本的_call_llm方法
+        
+        The interface of calling LLM for the agent.
+
+        We prepend the system_message of this agent to the messages, and call LLM.
+
+        Args:
+            messages: A list of messages.
+            functions: The list of functions provided to LLM.
+            stream: LLM streaming output or non-streaming output.
+              For consistency, we default to using streaming output across all agents.
+
+        Yields:
+            The response generator of LLM.
+        """
+
+        # Call the async method and get the result
+        result = await self._llm_manager.async_call(
+            messages=messages,
+            functions=functions,
+            stream=True,
+            extra_generate_cfg=merge_generate_cfgs(
+                base_generate_cfg=self.extra_generate_cfg,
+                new_generate_cfg=extra_generate_cfg,
+            )
+        )
+        
+        return result
+            
+
+    async def _async_call_tool(self, tool_name: str, tool_args: Union[str, dict] = '{}', **kwargs) -> Union[str, List[ContentItem]]:
+        """异步版本的_call_tool方法
+        
+        The interface of calling tools for the agent.
+
+        Args:
+            tool_name: The name of one tool.
+            tool_args: Model generated or user given tool parameters.
+
+        Returns:
+            The output of tools.
+        """
+        try:
+            # Check if tool manager has async_call method
+            return await self._tool_manager.async_call(tool_name, tool_args, **kwargs)
+        except (ToolServiceError, DocParserError) as ex:
+            raise ex
+        except Exception as ex:
+            exception_type = type(ex).__name__
+            exception_message = str(ex)
+            traceback_info = ''.join(traceback.format_tb(ex.__traceback__))
+            error_message = f'An error occurred when calling tool `{tool_name}`:\n' \
+                            f'{exception_type}: {exception_message}\n' \
+                            f'Traceback:\n{traceback_info}'
+            logger.warning(error_message)
+            return error_message
+
     def _init_tool(self, tool: Union[str, Dict, BaseTool]):
         self._tool_manager.add_tool(tool)
 
@@ -321,3 +471,11 @@ class BasicAgent(Agent):
         if kwargs.get('seed') is not None:
             extra_generate_cfg['seed'] = kwargs['seed']
         return self._call_llm(messages, extra_generate_cfg=extra_generate_cfg)
+
+    async def _async_run(self, messages: List[Message], lang: str = 'en', **kwargs) -> AsyncIterator[List[Message]]:
+        """异步版本的_run方法"""
+        extra_generate_cfg = {'lang': lang}
+        if kwargs.get('seed') is not None:
+            extra_generate_cfg['seed'] = kwargs['seed']
+        async for response in self._async_call_llm(messages, extra_generate_cfg=extra_generate_cfg):
+            yield response

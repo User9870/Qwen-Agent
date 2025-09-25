@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import copy
-from typing import Dict, Iterator, List, Literal, Optional, Union
+from typing import Dict, Iterator, List, Literal, Optional, Union, AsyncIterator
+import inspect
+import collections.abc
 
 from qwen_agent import Agent
 from qwen_agent.llm import BaseChatModel
@@ -107,6 +109,69 @@ class FnCallAgent(Agent):
                     break
         yield response
 
+    async def _async_run(self, messages: List[Message], lang: Literal['en', 'zh'] = 'en', **kwargs) -> AsyncIterator[List[Message]]:
+        """异步版本的_run方法"""
+        messages = copy.deepcopy(messages)
+        num_llm_calls_available = MAX_LLM_CALL_PER_RUN
+        response = []
+        while True and num_llm_calls_available > 0:
+            num_llm_calls_available -= 1
+
+            extra_generate_cfg = {'lang': lang}
+            if kwargs.get('seed') is not None:
+                extra_generate_cfg['seed'] = kwargs['seed']
+            # 使用异步调用LLM的方法
+            output_stream = await self._async_call_llm(
+                messages=messages,
+                functions=[func.function for func in self.function_map.values()],
+                extra_generate_cfg=extra_generate_cfg
+            )
+            
+            # Check if output_stream is an async iterator or a list
+            if hasattr(output_stream, '__aiter__'):
+                # It's an async iterator
+                output: List[Message] = []
+                async for output in output_stream:
+                    if output:
+                        # Ensure output is a list before concatenating
+                        if not isinstance(output, list):
+                            output = [output]
+                        yield response + output
+            else:
+                # It's a list (non-streaming response) or a coroutine
+                # If it's a coroutine, await it first
+                if hasattr(output_stream, '__await__'):
+                    output = await output_stream
+                else:
+                    output = output_stream
+                    
+                if output:
+                    # Ensure output is a list before concatenating
+                    if not isinstance(output, list):
+                        output = [output]
+                    yield response + output
+            
+            if output:
+                response.extend(output)
+                messages.extend(output)
+                used_any_tool = False
+                for out in output:
+                    use_tool, tool_name, tool_args, _ = self._detect_tool(out)
+                    if use_tool:
+                        # 使用异步调用工具的方法
+                        tool_result = await self._async_call_tool(tool_name, tool_args, messages=messages, **kwargs)
+                        fn_msg = Message(role=FUNCTION,
+                                         name=tool_name,
+                                         content=tool_result,
+                                         extra={'function_id': out.extra.get('function_id', '1')})
+                        messages.append(fn_msg)
+                        response.append(fn_msg)
+                        yield response
+                        used_any_tool = True
+                if not used_any_tool:
+                    break
+        yield response
+
     def _call_tool(self, tool_name: str, tool_args: Union[str, dict] = '{}', **kwargs) -> str:
         if tool_name not in self.function_map:
             return f'Tool {tool_name} does not exists.'
@@ -118,3 +183,16 @@ class FnCallAgent(Agent):
             return super()._call_tool(tool_name, tool_args, files=files, **kwargs)
         else:
             return super()._call_tool(tool_name, tool_args, **kwargs)
+    
+    async def _async_call_tool(self, tool_name: str, tool_args: Union[str, dict] = '{}', **kwargs) -> str:
+        """异步版本的_call_tool方法"""
+        if tool_name not in self.function_map:
+            return f'Tool {tool_name} does not exists.'
+        # Temporary plan: Check if it is necessary to transfer files to the tool
+        # Todo: This should be changed to parameter passing, and the file URL should be determined by the model
+        if self.function_map[tool_name].file_access:
+            assert 'messages' in kwargs
+            files = extract_files_from_messages(kwargs['messages'], include_images=True) + self.mem.system_files
+            return await super()._async_call_tool(tool_name, tool_args, files=files, **kwargs)
+        else:
+            return await super()._async_call_tool(tool_name, tool_args, **kwargs)
