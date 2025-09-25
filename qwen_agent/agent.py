@@ -40,6 +40,8 @@ class Agent(ABC):
                  system_message: Optional[str] = DEFAULT_SYSTEM_MESSAGE,
                  name: Optional[str] = None,
                  description: Optional[str] = None,
+                 llm_manager: Optional[LLMManager] = None,
+                 tool_manager: Optional[ToolManager] = None,
                  **kwargs):
         """Initialization the agent.
 
@@ -52,8 +54,8 @@ class Agent(ABC):
             name: The name of this agent.
             description: The description of this agent, which will be used for multi_agent.
         """
-        self._llm_manager = LLMManager(llm)
-        self._tool_manager = ToolManager(function_list)
+        self._llm_manager = llm_manager or LLMManager(llm)
+        self._tool_manager = tool_manager or ToolManager(function_list)
         
         self.extra_generate_cfg: dict = {}
         self.system_message = system_message
