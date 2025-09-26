@@ -150,7 +150,7 @@ class BaseTool(ABC):
         Returns:
             The result returned by the tool, implemented in the subclass.
         """
-    raise NotImplementedError
+        raise NotImplementedError
 
     def _verify_json_format_args(self, params: Union[str, dict], strict_json: bool = False) -> dict:
         """Verify the parameters of the function call"""
