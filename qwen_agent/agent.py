@@ -35,8 +35,8 @@ class Agent(ABC):
     """
 
     def __init__(self,
-                 function_list: Optional[List[Union[str, Dict, BaseTool]]] = None,
-                 llm: Optional[Union[dict, BaseChatModel]] = None,
+                 function_list: Optional[List[Union[str, Dict, BaseTool]]|ToolManager] = None,
+                 llm: Optional[Union[dict, BaseChatModel]|LLMManager] = None,
                  system_message: Optional[str] = DEFAULT_SYSTEM_MESSAGE,
                  name: Optional[str] = None,
                  description: Optional[str] = None,
@@ -54,8 +54,8 @@ class Agent(ABC):
             name: The name of this agent.
             description: The description of this agent, which will be used for multi_agent.
         """
-        self._llm_manager = llm_manager or LLMManager(llm)
-        self._tool_manager = tool_manager or ToolManager(function_list)
+        self._llm_manager = llm_manager or (llm if isinstance(llm, LLMManager) else LLMManager(llm))
+        self._tool_manager = tool_manager or (function_list if isinstance(function_list, ToolManager) else ToolManager(function_list))
         
         self.extra_generate_cfg: dict = {}
         self.system_message = system_message
