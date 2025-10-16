@@ -14,6 +14,7 @@ class ToolManager:
             initial_tools: 初始工具列表，可以是工具名称、配置字典或工具实例
         """
         self._tools: Dict[str, BaseTool] = {}
+        self._servers: Dict[str, str] = {}
         
         if initial_tools:
             for tool in initial_tools:
@@ -30,7 +31,8 @@ class ToolManager:
             self._tools[tool_name] = tool
         elif isinstance(tool, dict) and 'mcpServers' in tool:
             # 处理MCP服务器配置
-            mcp_tools = MCPManager().initConfig(tool)
+            mcp_tools, servers = MCPManager().initConfig(tool)
+            self._servers = servers
             for mcp_tool in mcp_tools:
                 tool_name = mcp_tool.name
                 self._tools[tool_name] = mcp_tool
@@ -47,6 +49,10 @@ class ToolManager:
                 raise ValueError(f'Tool {tool_name} is not registered.')
             
             self._tools[tool_name] = TOOL_REGISTRY[tool_name](tool_cfg)
+    
+    @property
+    def get_servers(self):
+        return self._servers
     
     def remove_tool(self, tool_name: str) -> bool:
         """从管理器中移除工具

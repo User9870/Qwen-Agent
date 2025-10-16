@@ -148,14 +148,15 @@ class MCPManager:
         # Submit coroutine to the event loop and wait for the result
         future = asyncio.run_coroutine_threadsafe(self.init_config_async(config), self.loop)
         try:
-            result = future.result()  # You can specify a timeout if desired
-            return result
+            result, servers = future.result()  # You can specify a timeout if desired
+            return result, servers
         except Exception as e:
             logger.info(f'Failed in initializing MCP tools: {e}')
             raise e
 
     async def init_config_async(self, config: Dict):
         tools: list = []
+        servers: list = []
         mcp_servers = config['mcpServers']
         for server_name in mcp_servers:
             client = MCPClient()
@@ -167,6 +168,7 @@ class MCPManager:
                 uuid.uuid4())  # To allow the same server name be used across different running agents
             client.client_id = client_id  # Ensure client_id is set on the client instance
             self.clients[client_id] = client  # Add to clients dict after successful connection
+            servers.append({server_name:client.server_info})
             for tool in client.tools:
                 """MCP tool example:
                 {
@@ -265,7 +267,7 @@ class MCPManager:
                                                                   tool_parameters=read_resource_params)
                 tools.append(read_resource_agent_tool)
 
-        return tools
+        return tools, servers
 
     def create_tool_class(self, register_name, register_client_id, tool_name, tool_desc, tool_parameters):
         manager = MCPManager()
@@ -335,6 +337,7 @@ class MCPClient:
         from mcp import ClientSession
         self.session: Optional[ClientSession] = None
         self.tools: list = None
+        self.server_info: dict = None
         self.exit_stack = AsyncExitStack()
         self.resources: bool = False
         self._last_mcp_server_name = None
@@ -390,8 +393,9 @@ class MCPClient:
                 logger.info(
                     f'Initializing a MCP stdio_client, if this takes forever, please check the config of this mcp server: {mcp_server_name}'
                 )
-
-            await self.session.initialize()
+            # MCP protocol handshake
+            initialize_result = await self.session.initialize()
+            self.server_info = initialize_result.instructions
             list_tools = await self.session.list_tools()
             self.tools = list_tools.tools
             try:
